@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: wolt-reg-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Almaty
+      SMS_BOT_DB: /app/data/bot.db
+      HERO_WEBHOOK_HOST: 0.0.0.0
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:18091:18091"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

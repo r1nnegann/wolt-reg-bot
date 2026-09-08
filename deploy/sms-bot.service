@@ -1,0 +1,20 @@
+[Unit]
+Description=wolt-reg-bot (Telegram + HeroSMS + Mail.tm)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=woltreg
+Group=woltreg
+WorkingDirectory=/opt/wolt-reg-bot
+ExecStart=/opt/wolt-reg-bot/.venv/bin/python /opt/wolt-reg-bot/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=SMS_BOT_ENV=/opt/wolt-reg-bot/.env
+Environment=SMS_BOT_DB=/opt/wolt-reg-bot/data/bot.db
+# Do not put BOT_TOKEN / HERO_KEY here. They live in .env (mode 0600).
+
+[Install]
+WantedBy=multi-user.target
