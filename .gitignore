@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 *.db
+*.db.*
+*.sqlite*
+backups/
+*.bak
 *.db-wal
 *.db-shm
 data/*.db
