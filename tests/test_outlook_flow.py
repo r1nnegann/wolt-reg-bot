@@ -58,22 +58,30 @@ class Isolated(unittest.IsolatedAsyncioTestCase):
         bot.DB_PATH = self.old_db
         self.tmp.cleanup()
     def quotes(self, mail=0.051, stock=10, sms=0.09, balance=2):
+        self.mock("hero_email_offers", return_value=[dict(name="outlook.com", cost=mail, count=stock)] if stock else [])
         self.mock("hero_email_offer", return_value=(mail, stock))
         self.mock("hero_get_price", return_value=(sms, 20))
         self.mock("_hero_balance", return_value=balance)
+    async def open_quote(self, cb, state, domain="outlook.com"):
+        await bot.cb_start_wolt_outlook(cb, state)
+        data = await state.get_data()
+        if data.get("hero_domains_token"):
+            index = next(i for i, offer in enumerate(data["hero_domains_offers"]) if offer["name"] == domain)
+            cb.data = f"hero_domain:{data['hero_domains_token']}:{index}"
+            await bot.cb_hero_domain(cb, state)
 
 class OutlookEntryTests(Isolated):
     async def test_quote_button_and_registered_handler_without_spending(self):
         buttons = [b for row in bot.service_choice_kb().inline_keyboard for b in row]
-        self.assertIn("📧 Wolt: Outlook + SMS (HeroSMS)", [b.text for b in buttons])
+        self.assertIn("📧 Wolt: почта + SMS (HeroSMS)", [b.text for b in buttons])
         self.assertIn("start_wolt_outlook", [b.callback_data for b in buttons])
         self.assertTrue(any(h.callback is bot.cb_start_wolt_outlook for h in bot.router.callback_query.handlers))
         self.quotes()
         buy = self.mock("hero_email_buy")
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         text = cb.message.edit_text.call_args.args[0]
-        for value in ("Outlook", "0.051", "0.090", "0.146", "2.00", "10"):
+        for value in ("outlook.com", "0.051", "0.090", "0.146", "2.00", "10"):
             self.assertIn(value, text)
         markup = cb.message.edit_text.call_args.kwargs["reply_markup"]
         confirm = [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data.startswith("confirm_outlook:")]
@@ -119,7 +127,7 @@ class OutlookPurchaseTests(Isolated):
         self.quotes()
         buy = self.mock("hero_email_buy", return_value=activation())
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         await bot.cb_confirm_outlook(cb, state)
         row = bot.db_get_latest_account(self.user["id"])
@@ -134,14 +142,14 @@ class OutlookPurchaseTests(Isolated):
         self.assertEqual(state.current, bot.RegState.waiting_wolt_email.state)
         self.assertIn("random@outlook.com", cb.message.edit_text.call_args.args[0])
         await bot.cb_confirm_outlook(cb, state)
-        buy.assert_called_once_with(KEY)
+        buy.assert_called_once_with(KEY, domain="outlook.com")
 
 class OutlookRefreshTests(Isolated):
     async def test_price_rise_requires_new_confirmation_and_insufficient_budget_never_buys(self):
         self.quotes()
         buy = self.mock("hero_email_buy", return_value=activation())
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         old = state.data["outlook_confirm"]
         cb.data = "confirm_outlook:" + old
         self.mock("hero_email_offer", return_value=(0.07, 10))
@@ -164,7 +172,7 @@ class OutlookRefreshTests(Isolated):
             await bot.cb_start_wolt_outlook(Callback(tid=tid), state)
             self.assertEqual(state.data, {"original": "preserved"})
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:stale"
         await bot.cb_confirm_outlook(cb, state)
         with sqlite3.connect(bot.DB_PATH) as conn:
@@ -178,13 +186,13 @@ class OutlookUncertaintyTests(Isolated):
         self.quotes()
         buy = self.mock("hero_email_buy", side_effect=httpx.ReadTimeout("SECRET_PROVIDER_BODY"))
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         await bot.cb_confirm_outlook(cb, state)
         await state.clear(); bot.db_init()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         self.assertIsNone(state.data.get("outlook_confirm"), "uncertain purchase must block renewed spending")
-        buy.assert_called_once_with(KEY)
+        buy.assert_called_once_with(KEY, domain="outlook.com")
         with sqlite3.connect(bot.DB_PATH) as conn:
             row = conn.execute("SELECT user_id,api_key,status FROM email_purchase_intents WHERE user_id=?", (self.user["id"],)).fetchone()
         self.assertEqual(row, (self.user["id"], KEY, "uncertain"))
@@ -431,7 +439,7 @@ class OutlookPurchaseAwaitTests(Isolated):
     async def test_state_change_during_quote_refresh_or_purchase_never_revives_session(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         buy = self.mock("hero_email_buy", return_value=activation())
         real_thread = asyncio.to_thread
@@ -445,7 +453,7 @@ class OutlookPurchaseAwaitTests(Isolated):
         buy.assert_not_called()
         self.assertIsNone(state.current)
         self.mock("asyncio.to_thread", new=real_thread)
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         async def change_on_purchase(fn, *args, **kwargs):
             value = await real_thread(fn, *args, **kwargs)
@@ -482,7 +490,7 @@ class OutlookOtherFlowFenceTests(Isolated):
     async def test_old_number_confirmation_cannot_spend_on_outlook_quote(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         number = self.mock("_purchase_number", new=AsyncMock(return_value={"activationId": 987, "phoneNumber": "77001234567", "activationCost": "0.09"}))
         cb.data = "confirm_buy"
         await bot.cb_confirm_buy(cb, state)
@@ -510,7 +518,7 @@ class OutlookEndToEndTests(Isolated):
         self.mock("_hero", return_value="ACCESS_READY")
         self.mock("sms_check", return_value=(True, "112233"))
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         await bot.cb_confirm_outlook(cb, state)
         await bot._wait_wolt_email(bot.ADMIN_ID, state)
@@ -579,7 +587,7 @@ class OutlookConcurrentTests(Isolated):
     async def test_concurrent_confirmation_and_shared_key_users_keep_exact_ownership(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         buy = self.mock("hero_email_buy", return_value=activation())
         await asyncio.gather(bot.cb_confirm_outlook(cb, state), bot.cb_confirm_outlook(cb, state))
@@ -587,7 +595,7 @@ class OutlookConcurrentTests(Isolated):
         with sqlite3.connect(bot.DB_PATH) as conn:
             other = conn.execute("INSERT INTO users(telegram_id,hero_key) VALUES(42,?)", (KEY,)).lastrowid
         cb2, state2 = Callback(tid=42), State()
-        await bot.cb_start_wolt_outlook(cb2, state2)
+        await self.open_quote(cb2, state2)
         cb2.data = "confirm_outlook:" + state2.data["outlook_confirm"]
         buy.return_value = activation(id=124, email="second@outlook.com")
         await bot.cb_confirm_outlook(cb2, state2)
@@ -658,7 +666,7 @@ class OutlookQuoteAwaitTests(Isolated):
                 await state.update_data(original="new-session")
             return result
         self.mock("asyncio.to_thread", new=changed)
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         self.assertEqual(state.current, bot.RegState.waiting_sms.state)
         self.assertEqual(state.data, {"original": "new-session"})
 
@@ -765,21 +773,24 @@ class OutlookInvalidCostTests(unittest.TestCase):
 
 class OutlookVersionTests(unittest.TestCase):
     def test_feature_version_matches_startup_banner(self):
-        self.assertIn("v2.15", bot.__doc__)
+        self.assertIn("v2.16", bot.__doc__)
         source = Path(bot.__file__).read_text()
-        self.assertIn('log.info("SMS bot v2.15 started")', source)
+        self.assertIn('log.info("SMS bot v2.16 started")', source)
+        readme = Path(bot.__file__).with_name("README.md").read_text()
+        self.assertIn("**Текущая линия: v2.16**", readme)
+        self.assertIn("domain=<выбранный домен>", readme)
 
 class OutlookSwitchedQuoteTests(Isolated):
     async def test_old_outlook_confirmation_is_invalid_after_service_choice_changes(self):
         self.quotes()
         buy = self.mock("hero_email_buy", return_value=activation())
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         token = state.data["outlook_confirm"]
         await bot.cb_choose_service(Callback("choose_service"), state)
         await bot.cb_confirm_outlook(Callback("confirm_outlook:" + token), state)
         buy.assert_not_called()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         token = state.data["outlook_confirm"]
         await state.update_data(service_key="gmail")
         await bot.cb_confirm_outlook(Callback("confirm_outlook:" + token), state)
@@ -795,7 +806,7 @@ class OutlookServiceEntryInvalidationTests(Isolated):
         for name in ("cb_start_gmail", "cb_start_wolt", "cb_start_wolt_sms", "cb_start_combo"):
             with self.subTest(handler=name):
                 await state.clear()
-                await bot.cb_start_wolt_outlook(cb, state)
+                await self.open_quote(cb, state)
                 token = state.data["outlook_confirm"]
                 await getattr(bot, name)(cb, state)
                 await bot.cb_confirm_outlook(Callback("confirm_outlook:" + token), state)
@@ -805,7 +816,7 @@ class OutlookPostServiceChangeTests(Isolated):
     async def test_service_change_during_paid_post_saves_email_but_keeps_new_service_state(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         self.mock("hero_email_buy", return_value=activation())
         real_thread = asyncio.to_thread

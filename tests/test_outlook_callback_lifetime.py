@@ -9,12 +9,13 @@ class OutlookCallbackLifetimeTests(Isolated):
     async def test_slow_paid_purchase_acknowledges_before_io_and_starts_mail_waiter(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         purchased = {"done": False}
         tasks = []
 
-        def purchase(key):
+        def purchase(key, domain):
+            self.assertEqual(domain, "outlook.com")
             purchased["done"] = True
             return activation()
 

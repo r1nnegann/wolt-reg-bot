@@ -927,14 +927,18 @@ class DelayedNumberActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(bot.db_number_action(self.aid))
 
     async def test_old_pending_cancel_does_not_hijack_failing_new_purchase(self):
+        from unittest.mock import patch
         bot.db_queue_number_action(self.aid, bot.ADMIN_ID, "cancel", None)
         async def failed_buy(*args, **kwargs):
             raise ValueError("NO_NUMBERS")
         bot._purchase_number = failed_buy
-        gmail = _FakeState({"service_code": "go", "service_key": "gmail", "db_user_id": self.user["id"],
-                            "country": 16, "cost": 0.1})
-        gmail.current = bot.RegState.confirming.state
+        gmail = _FakeState({})
         cb = _FakeCallback()
+        with patch.object(bot, "hero_get_price", return_value=(0.1, 20)), \
+                patch.object(bot, "_hero_balance", return_value=2):
+            await bot._show_confirm(cb, gmail, "gmail", country=16)
+        self.assertEqual(gmail.data["country"], 16)
+        self.assertEqual(gmail.data["hero_key"], bot.get_user_hero_key(self.user))
         await bot.cb_confirm_buy(cb, gmail)
         self.assertIsNone(gmail.current)
         self.assertTrue(any("NO_NUMBERS" in text for text, _ in cb.message.edits))

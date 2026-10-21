@@ -47,7 +47,7 @@ class OutlookPurchaseDiagnosticTests(Isolated):
     async def test_failure_logs_stage_and_class_but_never_provider_secret(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         self.mock("hero_email_buy", side_effect=bot.HeroEmailError("PRIVATE_PROVIDER_BODY " + KEY))
         with patch.object(bot.log, "error") as logged:
@@ -62,7 +62,7 @@ class OutlookPurchaseDiagnosticTests(Isolated):
     async def test_nullable_wait_resource_is_saved_and_mail_waiter_is_started(self):
         self.quotes()
         cb, state = Callback(), State()
-        await bot.cb_start_wolt_outlook(cb, state)
+        await self.open_quote(cb, state)
         cb.data = "confirm_outlook:" + state.data["outlook_confirm"]
         payload = activation(message=None, value=None)
         with patch.object(bot.httpx, "post", return_value=httpx.Response(201, json={"data": payload})) as post:

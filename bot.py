@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SMS Bot v2.15 — Outlook Wolt activation; durable number cancellation retained."""
+"""SMS Bot v2.16 — selectable HeroSMS Wolt email domains; durable cancellation retained."""
 import asyncio, html as html_lib, json, os, re, secrets, string, tempfile, time, sqlite3, datetime, traceback, logging, httpx
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
@@ -372,6 +372,9 @@ def db_init():
             ON pending_number_actions(status, due_at);
         """)
         c = conn.cursor()
+        intent_cols = {row[1] for row in c.execute("PRAGMA table_info(email_purchase_intents)")}
+        if "domain" not in intent_cols:
+            c.execute("ALTER TABLE email_purchase_intents ADD COLUMN domain TEXT NOT NULL DEFAULT 'outlook.com'")
         account_cols = {row[1] for row in c.execute("PRAGMA table_info(accounts)")}
         for name, definition in {
             "mail_provider": "TEXT NOT NULL DEFAULT 'mailtm'",
@@ -1210,7 +1213,9 @@ def db_email_intent(user_id):
         conn.close()
 
 
-def db_begin_email_intent(user_id, token, api_key, cost):
+def db_begin_email_intent(user_id, token, api_key, cost, domain="outlook.com"):
+    if not _valid_email_domain(domain):
+        raise HeroEmailError("HeroSMS: неверный домен почты")
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1218,8 +1223,8 @@ def db_begin_email_intent(user_id, token, api_key, cost):
         if row and row[0] == "uncertain":
             raise HeroEmailError("Требуется ручная сверка HeroSMS")
         conn.execute(
-            "INSERT OR REPLACE INTO email_purchase_intents (user_id,token,api_key,quoted_cost,status) "
-            "VALUES (?,?,?,?,'uncertain')", (user_id, token, api_key, cost),
+            "INSERT OR REPLACE INTO email_purchase_intents (user_id,token,api_key,quoted_cost,status,domain) "
+            "VALUES (?,?,?,?,'uncertain',?)", (user_id, token, api_key, cost, domain),
         )
         conn.commit()
     finally:
@@ -1409,13 +1414,27 @@ def _hero_email_request(method, path, api_key, **kwargs):
         raise HeroEmailError("HeroSMS: ответ не подтверждён") from None
 
 
-def _validate_hero_email(data, expected_id=None, expected_email=None):
+def _valid_email_domain(domain):
+    """ASCII DNS name only; never normalize a caller's selected domain."""
+    return (isinstance(domain, str) and domain.isascii() and 3 <= len(domain) <= 253
+            and "." in domain and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label,
+                                                   flags=re.IGNORECASE)
+                                          for label in domain.split(".")))
+
+
+def _validate_hero_email(data, expected_id=None, expected_email=None, expected_domain=None):
     try:
         if not isinstance(data, dict) or type(data["id"]) is not int or data["id"] <= 0:
             raise ValueError
         if expected_id is not None and data["id"] != int(expected_id):
             raise ValueError
-        if data["site"] != "wolt.com" or not re.fullmatch(r"[a-zA-Z0-9._%+\-]+@outlook\.com", data["email"]):
+        email = data["email"]
+        if (data["site"] != "wolt.com" or not isinstance(email, str) or len(email) > 254
+                or email.count("@") != 1):
+            raise ValueError
+        local, domain = email.split("@")
+        if (not re.fullmatch(r"[a-zA-Z0-9._%+\-]{1,64}", local) or not _valid_email_domain(domain)
+                or expected_domain is not None and domain != expected_domain):
             raise ValueError
         if expected_email is not None and data["email"] != expected_email:
             raise ValueError
@@ -1431,14 +1450,16 @@ def _validate_hero_email(data, expected_id=None, expected_email=None):
             raise ValueError
         return data
     except (ValueError, TypeError, KeyError, InvalidOperation):
-        raise HeroEmailError("HeroSMS: неверная Outlook активация") from None
+        raise HeroEmailError("HeroSMS: неверная активация почты") from None
 
 
-def hero_email_buy(api_key):
+def hero_email_buy(api_key, domain="outlook.com"):
     # Never retry: a timeout/non-JSON response can still have charged the key.
+    if not _valid_email_domain(domain):
+        raise HeroEmailError("HeroSMS: неверный домен почты")
     return _validate_hero_email(_hero_email_request(
-        "POST", "/emails", api_key, json={"site": "wolt.com", "domain": "outlook.com"},
-    ))
+        "POST", "/emails", api_key, json={"site": "wolt.com", "domain": domain},
+    ), expected_domain=domain)
 
 
 def hero_email_get(activation_id, api_key):
@@ -1510,20 +1531,44 @@ async def _delete_remote_mail(account):
         await asyncio.to_thread(mail_delete, account["mail_tm_id"], token)
 
 
-def hero_email_offer(api_key):
+def hero_email_offers(api_key):
+    """Site-bound live catalog; malformed/ambiguous names are never selectable."""
     domains = _hero_email_request("GET", "/emails/domains", api_key, params={"site": "wolt.com"})
     if not isinstance(domains, list):
         raise HeroEmailError("HeroSMS: неверный список доменов")
+    offers, seen, duplicates = {}, set(), set()
+    valid_rows = 0
     for row in domains:
-        if isinstance(row, dict) and row.get("name") == "outlook.com":
-            try:
-                cost = float(row["cost"])
-                count = row["count"]
-                if isinstance(row["cost"], bool) or not Decimal(str(cost)).is_finite() or cost < 0 or type(count) is not int or count < 0:
-                    raise ValueError
-                return cost, count
-            except (ValueError, TypeError, KeyError):
-                raise HeroEmailError("HeroSMS: неверная цена Outlook") from None
+        if not isinstance(row, dict) or not _valid_email_domain(row.get("name")):
+            continue
+        name = row["name"]
+        canonical = name.lower()
+        if canonical in seen:
+            duplicates.add(canonical)
+        seen.add(canonical)
+        try:
+            cost = Decimal(str(row["cost"]))
+            count = row["count"]
+            if (isinstance(row["cost"], bool) or not cost.is_finite() or cost < 0
+                    or not Decimal(str(float(cost))).is_finite() or type(count) is not int or count < 0):
+                continue
+            valid_rows += 1
+            if count:
+                offers[canonical] = {"name": name, "cost": float(cost), "count": count}
+        except (ValueError, TypeError, KeyError, InvalidOperation, OverflowError):
+            continue
+    if domains and not valid_rows:
+        raise HeroEmailError("HeroSMS: неверные предложения почты")
+    return sorted((offer for name, offer in offers.items() if name not in duplicates),
+                  key=lambda offer: (offer["cost"], offer["name"]))
+
+
+def hero_email_offer(api_key, domain="outlook.com"):
+    if not _valid_email_domain(domain):
+        raise HeroEmailError("HeroSMS: неверный домен почты")
+    for offer in hero_email_offers(api_key):
+        if offer["name"] == domain:
+            return offer["cost"], offer["count"]
     return 0.0, 0
 
 
@@ -2383,7 +2428,7 @@ def _session_markup(current_state, is_admin=False, link=None, pending_account_id
 def service_choice_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📧 Wolt: почта + SMS (KZ +7)", callback_data="start_wolt")],
-        [InlineKeyboardButton(text="📧 Wolt: Outlook + SMS (HeroSMS)", callback_data="start_wolt_outlook")],
+        [InlineKeyboardButton(text="📧 Wolt: почта + SMS (HeroSMS)", callback_data="start_wolt_outlook")],
         [InlineKeyboardButton(text="📲 Wolt: только SMS (KZ +7)", callback_data="start_wolt_sms")],
         [InlineKeyboardButton(text="📧 Gmail (выбор страны)", callback_data="start_gmail")],
         [InlineKeyboardButton(text="🔗 Google → Wolt SMS", callback_data="start_combo")],
@@ -2611,7 +2656,8 @@ async def cb_choose_service(cb: CallbackQuery, state: FSMContext):
             await state.set_state(RegState.waiting_hero_key)
             await cb.answer(); return
 
-        await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None)
+        await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None, hero_domains_token=None,
+                                sms_confirm_token=None)
         await cb.message.edit_text(
             "📍 <b>Выбери регистрацию</b>\n\n"
             "• <b>Wolt: почта + SMS</b> — Mail.tm и номер KZ.\n"
@@ -2653,6 +2699,7 @@ async def _load_wolt_state(state, account, user_row):
             sms_key = _row_get(activation, "api_key") or sms_key
     await state.update_data(
         mail_provider=_row_get(account, "mail_provider", "mailtm"),
+        mail_domain=account["email"].rsplit("@", 1)[-1],
         mail_activation_id=_row_get(account, "mail_activation_id"),
         mail_api_key=_row_get(account, "mail_api_key"),
         mail_cost=_row_get(account, "mail_cost"),
@@ -2827,7 +2874,8 @@ async def _show_confirm(cb: CallbackQuery, state: FSMContext, service_key: str, 
         user_row = db_get_user(cb.from_user.id)
         if not user_row: return
         svc = SERVICES[service_key]
-        hk = get_user_hero_key(user_row)
+        hk = get_user_hero_key(user_row) or (HERO_KEY if _uses_admin_hero(user_row) else None)
+        await state.update_data(sms_confirm_token=None)
 
         await cb.message.edit_text("⏳ Проверяю цены...")
         await cb.answer()
@@ -2918,6 +2966,8 @@ async def _show_confirm(cb: CallbackQuery, state: FSMContext, service_key: str, 
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
             ]),
         )
+        await state.set_state(RegState.confirming)
+        await state.update_data(sms_confirm_token=secrets.token_hex(12))
     except Exception as e:
         db_error_log(cb.from_user.id, "confirm_price", str(e), traceback.format_exc())
         await cb.message.edit_text(
@@ -2962,7 +3012,7 @@ async def _wait_hero_wolt_email(chat_id, state):
                 _validate_hero_email(mail, data["mail_activation_id"], data["email"])
             except Exception:
                 await _hero_email_recovery(chat_id, state, account_id, watch_id,
-                    "⚠️ Не удалось проверить HeroSMS Outlook. Активация сохранена; можно проверить ещё раз. SMS не покупался.")
+                    "⚠️ Не удалось проверить почту HeroSMS. Активация сохранена; можно проверить ещё раз. SMS не покупался.")
                 return
             mail_status = mail["status"]
             db_update_account(account_id, mail_status=mail_status)
@@ -2983,7 +3033,7 @@ async def _wait_hero_wolt_email(chat_id, state):
             if delivered is None:
                 db_update_account(account_id, status="email_error")
                 await state.clear()
-                await _safe_send(chat_id, "⚠️ Ссылку не удалось доставить. Outlook и ссылка сохранены; SMS не покупался.",
+                await _safe_send(chat_id, "⚠️ Ссылку не удалось доставить. Почта HeroSMS и ссылка сохранены; SMS не покупался.",
                                  reply_markup=_wolt_retry_kb(account_id, "email"))
                 return
             db_update_account(account_id, email_link_delivered=1)
@@ -2994,7 +3044,7 @@ async def _wait_hero_wolt_email(chat_id, state):
         return
     db_update_account(account_id, status="email_timeout")
     await state.clear()
-    await _safe_send(chat_id, "⚠️ Письмо Wolt не пришло за 5 минут. Outlook активация сохранена для проверки; возврат не обещан.",
+    await _safe_send(chat_id, "⚠️ Письмо Wolt не пришло за 5 минут. Активация почты HeroSMS сохранена для проверки; возврат не обещан.",
                      reply_markup=_wolt_retry_kb(account_id, "email"))
 
 
@@ -3176,11 +3226,135 @@ async def _begin_wolt_registration(cb: CallbackQuery, state: FSMContext):
             await cb.answer(f"Ошибка: {exc}", show_alert=True)
 
 
-async def _outlook_quote(cb, state, key, user):
-    request_id = secrets.token_hex(12)
-    await state.update_data(outlook_quote_request=request_id, service_key="wolt_outlook", outlook_confirm=None)
+async def _hero_ui_unchanged(cb, state, snapshot, current=RegState.confirming.state):
+    return (db_get_user(cb.from_user.id) is not None
+            and await state.get_state() == current and await state.get_data() == snapshot)
+
+
+async def _hero_domain_picker(cb, state, key, user):
+    token = secrets.token_hex(12)
+    await state.update_data(hero_domains_token=token, hero_domains_offers=[],
+                            mail_domain=None, outlook_confirm=None, outlook_quote_request=None,
+                            service_code=None, hero_key=None, max_price=None, sms_confirm_token=None,
+                            db_user_id=user["id"], service_key="wolt_outlook", mail_api_key=key)
     await state.set_state(RegState.confirming)
-    mail_cost, stock = await asyncio.to_thread(hero_email_offer, key)
+    offers = await asyncio.to_thread(hero_email_offers, key)
+    data = await state.get_data()
+    if (not db_get_user(cb.from_user.id) or await state.get_state() != RegState.confirming.state
+            or data.get("hero_domains_token") != token or data.get("service_key") != "wolt_outlook"):
+        return
+    await state.update_data(hero_domains_offers=offers, hero_domains_page=0)
+    await _hero_domain_page(cb, offers, token, 0)
+
+
+HERO_DOMAIN_PAGE_SIZE = 8
+
+
+async def _hero_domain_page(cb, offers, token, page):
+    start = page * HERO_DOMAIN_PAGE_SIZE
+    pages = max(1, (len(offers) + HERO_DOMAIN_PAGE_SIZE - 1) // HERO_DOMAIN_PAGE_SIZE)
+    rows = [[InlineKeyboardButton(text=f"{offer['name']} · ${offer['cost']:.4f} · {offer['count']} шт",
+                                  callback_data=f"hero_domain:{token}:{index}")]
+            for index, offer in enumerate(offers[start:start + HERO_DOMAIN_PAGE_SIZE], start)]
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton(text="⬅️", callback_data=f"hero_domains_page:{token}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="➡️", callback_data=f"hero_domains_page:{token}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    await cb.message.edit_text(
+        "📧 <b>Почта HeroSMS для Wolt</b>\n\nВыбери домен · цена USD · наличие.\n"
+        f"Страница {page + 1}/{pages}. Покупки пока нет; после выбора покажу общую оценку с SMS."
+        + ("\nНет доступных доменов." if not offers else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows + [
+            [InlineKeyboardButton(text="🔄 Обновить домены", callback_data=f"hero_domains_refresh:{token}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="choose_service")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("hero_domains_page:"))
+@router.callback_query(F.data.startswith("hero_domains_refresh:"))
+async def cb_hero_domains(cb: CallbackQuery, state: FSMContext):
+    async with _chat_lock(cb.from_user.id):
+        user = db_get_user(cb.from_user.id)
+        data = await state.get_data()
+        parts = cb.data.split(":") if isinstance(cb.data, str) else []
+        page = None
+        if (len(parts) == 3 and parts[0] == "hero_domains_page"
+                and re.fullmatch(r"0|[1-9][0-9]{0,5}", parts[2])):
+            page = int(parts[2])
+        is_refresh = len(parts) == 2 and parts[0] == "hero_domains_refresh"
+        if (not user or await state.get_state() != RegState.confirming.state
+                or data.get("service_key") != "wolt_outlook" or data.get("db_user_id") != user["id"]
+                or len(parts) < 2 or not parts[1] or parts[1] != data.get("hero_domains_token")
+                or not is_refresh and (page is None or page >= max(1, (len(data.get("hero_domains_offers", [])) + HERO_DOMAIN_PAGE_SIZE - 1) // HERO_DOMAIN_PAGE_SIZE))):
+            await cb.answer("Список доменов устарел", show_alert=True)
+            return
+        try:
+            await cb.answer()
+        except TelegramBadRequest:
+            return
+        try:
+            if is_refresh:
+                if not await _hero_ui_unchanged(cb, state, data):
+                    return
+                key = get_user_hero_key(user) or (HERO_KEY if _uses_admin_hero(user) else None)
+                if not key:
+                    await _safe_send_raw(cb.from_user.id, "Нужен HeroSMS ключ")
+                    return
+                await _hero_domain_picker(cb, state, key, user)
+            else:
+                if not await _hero_ui_unchanged(cb, state, data):
+                    return
+                await state.update_data(hero_domains_page=page)
+                await _hero_domain_page(cb, data["hero_domains_offers"], parts[1], page)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc):
+                await _safe_send_raw(cb.from_user.id, "Не удалось показать домены HeroSMS")
+        except Exception:
+            await _safe_send_raw(cb.from_user.id, "Не удалось обновить домены HeroSMS. Покупки не было.")
+
+
+@router.callback_query(F.data.startswith("hero_domain:"))
+async def cb_hero_domain(cb: CallbackQuery, state: FSMContext):
+    async with _chat_lock(cb.from_user.id):
+        user = db_get_user(cb.from_user.id)
+        data = await state.get_data()
+        parts = cb.data.split(":") if isinstance(cb.data, str) else []
+        if (not user or await state.get_state() != RegState.confirming.state
+                or data.get("service_key") != "wolt_outlook" or data.get("db_user_id") != user["id"]
+                or len(parts) != 3 or parts[0] != "hero_domain"
+                or not parts[1] or parts[1] != data.get("hero_domains_token")
+                or not re.fullmatch(r"0|[1-9][0-9]{0,5}", parts[2])
+                or int(parts[2]) >= len(data.get("hero_domains_offers", []))):
+            await cb.answer("Выбор домена устарел", show_alert=True)
+            return
+        domain = data["hero_domains_offers"][int(parts[2])]["name"]
+        key = get_user_hero_key(user) or (HERO_KEY if _uses_admin_hero(user) else None)
+        if not key:
+            await cb.answer("Нужен HeroSMS ключ", show_alert=True)
+            return
+        try:
+            await cb.answer()
+        except TelegramBadRequest:
+            return
+        try:
+            if not await _hero_ui_unchanged(cb, state, data):
+                return
+            await _outlook_quote(cb, state, key, user, domain)
+        except Exception:
+            await _safe_send_raw(cb.from_user.id, "Не удалось проверить цены почты HeroSMS. Покупки не было.")
+
+
+async def _outlook_quote(cb, state, key, user, domain):
+    request_id = secrets.token_hex(12)
+    await state.update_data(outlook_quote_request=request_id, service_key="wolt_outlook", outlook_confirm=None,
+                            hero_domains_token=None, mail_domain=domain, sms_confirm_token=None)
+    await state.set_state(RegState.confirming)
+    mail_cost, stock = await asyncio.to_thread(hero_email_offer, key, domain)
     sms_cost, sms_stock = await asyncio.to_thread(hero_get_price, "rr", COUNTRY_KZ, key)
     balance = await asyncio.to_thread(_hero_balance, key)
     if (not db_get_user(cb.from_user.id) or await state.get_state() != RegState.confirming.state
@@ -3195,18 +3369,52 @@ async def _outlook_quote(cb, state, key, user):
     await state.set_state(RegState.confirming)
     rows = []
     if stock > 0 and sms_stock > 0 and balance >= total:
-        rows.append([InlineKeyboardButton(text="✅ Купить Outlook и продолжить", callback_data=f"confirm_outlook:{token}")])
+        rows.append([InlineKeyboardButton(text="✅ Купить почту и продолжить", callback_data=f"confirm_outlook:{token}")])
     await cb.message.edit_text(
-        f"📧 <b>Outlook + Wolt SMS KZ (HeroSMS)</b>\n\n"
-        f"Outlook: ${mail_cost:.4f} · {stock} шт\nWolt SMS KZ: ${sms_cost:.4f} · {sms_stock} шт\n"
+        f"📧 <b>Почта HeroSMS + Wolt SMS KZ</b>\n\n"
+        f"Домен: <code>{html_lib.escape(domain)}</code>\nПочта: ${mail_cost:.4f} · {stock} шт\nWolt SMS KZ: ${sms_cost:.4f} · {sms_stock} шт\n"
         f"Баланс: ${balance:.2f}\nОценка всего с SMS margin: ${total:.4f}\n\n"
-        "Покупка только после подтверждения. Outlook привязан к wolt.com, это не постоянный ящик."
+        "Покупка только после подтверждения. Почта привязана к wolt.com, это не постоянный ящик."
         + ("\n❌ Нет запаса или недостаточно средств." if not rows else ""),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows + [
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="start_wolt_outlook")],
+            [InlineKeyboardButton(text="🔄 Обновить оценку", callback_data=f"hero_quote_refresh:{token}")],
+            [InlineKeyboardButton(text="🔙 Сменить домен", callback_data=f"hero_quote_domains:{token}")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
         ]),
     )
+
+
+@router.callback_query(F.data.startswith("hero_quote_refresh:"))
+@router.callback_query(F.data.startswith("hero_quote_domains:"))
+async def cb_hero_quote(cb: CallbackQuery, state: FSMContext):
+    async with _chat_lock(cb.from_user.id):
+        user = db_get_user(cb.from_user.id)
+        data = await state.get_data()
+        parts = cb.data.split(":") if isinstance(cb.data, str) else []
+        if (not user or await state.get_state() != RegState.confirming.state
+                or data.get("service_key") != "wolt_outlook" or data.get("db_user_id") != user["id"]
+                or len(parts) != 2 or parts[0] not in ("hero_quote_refresh", "hero_quote_domains")
+                or not parts[1] or parts[1] != data.get("outlook_confirm")
+                or not _valid_email_domain(data.get("mail_domain"))):
+            await cb.answer("Оценка устарела", show_alert=True)
+            return
+        key = get_user_hero_key(user) or (HERO_KEY if _uses_admin_hero(user) else None)
+        if not key:
+            await cb.answer("Нужен HeroSMS ключ", show_alert=True)
+            return
+        try:
+            await cb.answer()
+        except TelegramBadRequest:
+            return
+        try:
+            if not await _hero_ui_unchanged(cb, state, data):
+                return
+            if parts[0] == "hero_quote_domains":
+                await _hero_domain_picker(cb, state, key, user)
+            else:
+                await _outlook_quote(cb, state, key, user, data["mail_domain"])
+        except Exception:
+            await _safe_send_raw(cb.from_user.id, "Не удалось обновить оценку HeroSMS. Покупки не было.")
 
 
 @router.callback_query(F.data == "start_wolt_outlook")
@@ -3221,17 +3429,23 @@ async def cb_start_wolt_outlook(cb: CallbackQuery, state: FSMContext):
             return
         intent = db_email_intent(user["id"])
         if intent and intent["status"] == "uncertain":
-            await cb.answer("Покупка Outlook не подтверждена. Нужна сверка HeroSMS вручную; повторная покупка заблокирована.", show_alert=True)
+            await cb.answer("Покупка почты HeroSMS не подтверждена. Нужна сверка вручную; повторная покупка заблокирована.", show_alert=True)
             return
         key = get_user_hero_key(user) or (HERO_KEY if _uses_admin_hero(user) else None)
         if not key:
             await cb.answer("Нужен HeroSMS ключ", show_alert=True)
             return
+        snapshot, current = await state.get_data(), await state.get_state()
         try:
-            await _outlook_quote(cb, state, key, user)
             await cb.answer()
+        except TelegramBadRequest:
+            return
+        try:
+            if not await _hero_ui_unchanged(cb, state, snapshot, current):
+                return
+            await _hero_domain_picker(cb, state, key, user)
         except Exception:
-            await cb.answer("Не удалось проверить цены HeroSMS. Попробуй позже.", show_alert=True)
+            await _safe_send_raw(cb.from_user.id, "Не удалось получить домены HeroSMS. Попробуй позже.")
 
 
 @router.callback_query(F.data.startswith("confirm_outlook:"))
@@ -3239,9 +3453,10 @@ async def cb_confirm_outlook(cb: CallbackQuery, state: FSMContext):
     async with _chat_lock(cb.from_user.id):
         user = db_get_user(cb.from_user.id)
         data = await state.get_data()
-        token = cb.data.split(":", 1)[1]
+        token = cb.data.split(":", 1)[1] if isinstance(cb.data, str) and cb.data.startswith("confirm_outlook:") else ""
         if (not user or await state.get_state() != RegState.confirming.state or not token
-                or data.get("service_key") != "wolt_outlook" or data.get("outlook_confirm") != token):
+                or data.get("service_key") != "wolt_outlook" or data.get("outlook_confirm") != token
+                or data.get("db_user_id") != user["id"] or not _valid_email_domain(data.get("mail_domain"))):
             await cb.answer("Подтверждение устарело", show_alert=True)
             return
         intent = db_email_intent(user["id"])
@@ -3258,44 +3473,54 @@ async def cb_confirm_outlook(cb: CallbackQuery, state: FSMContext):
         async def notify(text):
             await _safe_send_raw(cb.from_user.id, text)
 
+        if not await _hero_ui_unchanged(cb, state, data):
+            return
         key = data["mail_api_key"]
+        domain = data["mail_domain"]
         try:
-            mail_cost, stock = await asyncio.to_thread(hero_email_offer, key)
+            mail_cost, stock = await asyncio.to_thread(hero_email_offer, key, domain)
             sms_cost, sms_stock = await asyncio.to_thread(hero_get_price, "rr", COUNTRY_KZ, key)
             balance = await asyncio.to_thread(_hero_balance, key)
         except Exception:
             await notify("Не удалось обновить цены HeroSMS. Покупки не было.")
             return
-        if (not db_get_user(cb.from_user.id) or await state.get_state() != RegState.confirming.state
-                or (await state.get_data()).get("outlook_confirm") != token
-                or (await state.get_data()).get("service_key") != "wolt_outlook"):
+        if not await _hero_ui_unchanged(cb, state, data):
             await notify("Сессия изменилась; покупки не было")
+            return
+        user = db_get_user(cb.from_user.id)
+        if not user:
+            return
+        current_key = get_user_hero_key(user) or (HERO_KEY if _uses_admin_hero(user) else None)
+        if not current_key:
+            await state.update_data(outlook_confirm=None, outlook_quote_request=None)
+            await notify("HeroSMS ключ изменён или удалён. Покупки не было; выбери домен заново после настройки ключа.")
             return
         total = float(Decimal(str(mail_cost)) + Decimal(str(sms_cost)) + Decimal(str(PRICE_MARGIN)))
         if (mail_cost > data["mail_quote"] or total > data["outlook_total"]
-                or (get_user_hero_key(user) or HERO_KEY) != key or stock <= 0 or sms_stock <= 0 or balance < total):
-            await _outlook_quote(cb, state, get_user_hero_key(user) or HERO_KEY, user)
+                or current_key != key or stock <= 0 or sms_stock <= 0 or balance < total):
+            await _outlook_quote(cb, state, current_key, user, domain)
             await notify("Цена/доступность изменилась: проверь и подтверди заново.")
             return
         await state.update_data(outlook_confirm=None, outlook_purchase=token)
         phase = "purchase_intent"
         try:
-            db_begin_email_intent(user["id"], token, key, mail_cost)
+            db_begin_email_intent(user["id"], token, key, mail_cost, domain=domain)
             phase = "purchase_response"
-            mail = await asyncio.to_thread(hero_email_buy, key)
+            mail = await asyncio.to_thread(hero_email_buy, key, domain=domain)
+            _validate_hero_email(mail, expected_domain=domain)
             phase = "save_account"
             account_id = db_add_hero_account(user["id"], mail, key)
             if (not db_get_user(cb.from_user.id) or await state.get_state() != RegState.confirming.state
                     or (await state.get_data()).get("outlook_purchase") != token
                     or (await state.get_data()).get("service_key") != "wolt_outlook"):
-                await notify("Outlook сохранён; сессия изменилась. Продолжение доступно через «Мои почты».")
+                await notify("Почта HeroSMS сохранена; сессия изменилась. Продолжение доступно через «Мои почты».")
                 return
             phase = "restore_session"
             await _load_wolt_state(state, db_get_account(account_id, user["id"]), user)
             await state.set_state(RegState.waiting_wolt_email)
             phase = "deliver_address"
             await cb.message.edit_text(
-                f"📧 <b>Outlook Wolt готов</b>\n\n<code>{html_lib.escape(mail['email'])}</code>\n\n"
+                f"📧 <b>Почта HeroSMS для Wolt готова</b>\n\n<code>{html_lib.escape(mail['email'])}</code>\n\n"
                 "Введи email в Wolt. Жду письмо 5 минут, пришлю ссылку, затем куплю SMS KZ.\n"
                 "Активация только для wolt.com, не постоянный ящик; возврат не обещан.",
                 reply_markup=menu_kb(RegState.waiting_wolt_email, is_admin=_is_admin(user)),
@@ -3303,15 +3528,15 @@ async def cb_confirm_outlook(cb: CallbackQuery, state: FSMContext):
             phase = "start_mail_watcher"
             asyncio.create_task(_wait_wolt_email(cb.message.chat.id, state))
         except Exception as exc:
-            log.error("Outlook purchase failed: phase=%s error_class=%s", phase, type(exc).__name__)
+            log.error("HeroSMS email purchase failed: phase=%s error_class=%s", phase, type(exc).__name__)
             if (await state.get_data()).get("outlook_purchase") == token:
                 await state.clear()
-            await notify("Покупка Outlook не подтверждена. Проверь HeroSMS вручную; не покупай повторно вслепую.")
+            await notify("Покупка почты HeroSMS не подтверждена. Проверь вручную; не покупай повторно вслепую.")
 
 
 @router.callback_query(F.data == "start_wolt")
 async def cb_start_wolt(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(outlook_confirm=None, outlook_quote_request=None)
+    await state.update_data(outlook_confirm=None, outlook_quote_request=None, hero_domains_token=None)
     await _begin_wolt_registration(cb, state)
 
 
@@ -3321,7 +3546,7 @@ async def cb_start_wolt_sms(cb: CallbackQuery, state: FSMContext):
     if current not in (None, RegState.confirming.state):
         await cb.answer("Уже есть активная сессия", show_alert=True)
         return
-    await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None)
+    await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None, hero_domains_token=None)
     await _show_confirm(cb, state, "wolt")
 
 
@@ -3332,10 +3557,10 @@ async def _cancel_hero_mail_session(cb, state, account, user_row):
     try:
         await _cancel_hero_email(account)
         db_update_account(account["id"], mail_session="closed")
-        text = "❌ Outlook сессия закрыта. Запись сохранена; использованное письмо не отменяется. Возврат не обещан."
+        text = "❌ Сессия почты HeroSMS закрыта. Запись сохранена; использованное письмо не отменяется. Возврат не обещан."
     except Exception:
         db_update_account(account["id"], mail_session="cancel_unconfirmed")
-        text = "⚠️ Сессия закрыта, отмена Outlook не подтверждена. ID и исходный ключ сохранены; проверь HeroSMS вручную. Возврат не обещан."
+        text = "⚠️ Сессия закрыта, отмена почты HeroSMS не подтверждена. ID и исходный ключ сохранены; проверь вручную. Возврат не обещан."
     await cb.message.edit_text(text, reply_markup=menu_kb(None, is_admin=_is_admin(user_row)))
     await cb.answer()
 
@@ -3509,13 +3734,13 @@ async def cb_cancel_wolt(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "start_gmail")
 async def cb_start_gmail(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None)
+    await state.update_data(combo=None, outlook_confirm=None, outlook_quote_request=None, hero_domains_token=None)
     await _show_gmail_countries(cb, state, page=0, refresh=True)
 
 
 @router.callback_query(F.data == "start_combo")
 async def cb_start_combo(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(combo="gmail_then_wolt", outlook_confirm=None, outlook_quote_request=None)
+    await state.update_data(combo="gmail_then_wolt", outlook_confirm=None, outlook_quote_request=None, hero_domains_token=None)
     await _show_gmail_countries(cb, state, page=0, refresh=True)
 
 
@@ -3554,6 +3779,7 @@ async def _show_gmail_countries(cb: CallbackQuery, state: FSMContext, page=0, re
     if current not in (None, RegState.confirming.state):
         await cb.answer("Уже есть активная сессия", show_alert=True)
         return
+    await state.update_data(sms_confirm_token=None)
     hk = get_user_hero_key(user_row)
     if hk is None and not _uses_admin_hero(user_row):
         await cb.message.edit_text(
@@ -3628,31 +3854,56 @@ async def _show_gmail_countries(cb: CallbackQuery, state: FSMContext, page=0, re
 
 @router.callback_query(F.data == "confirm_buy")
 async def cb_confirm_buy(cb: CallbackQuery, state: FSMContext):
+    lock = _chat_lock(cb.from_user.id)
+    if lock.locked():
+        await cb.answer("Идёт покупка или другая операция", show_alert=True)
+        return
+    await lock.acquire()
     try:
         data = await state.get_data()
-        if not data or "service_code" not in data:
-            await cb.answer("Данные сессии устарели. Начни заново.", show_alert=True)
-            await state.clear(); return
-
         user_row = db_get_user(cb.from_user.id)
-        if not user_row: return
+        svc = SERVICES.get(data.get("service_key"))
+        hk = (get_user_hero_key(user_row) or (HERO_KEY if _uses_admin_hero(user_row) else None)) if user_row else None
+        if (not user_row or await state.get_state() != RegState.confirming.state
+                or not data.get("sms_confirm_token") or not svc or data.get("service_code") != svc["code"]
+                or data.get("db_user_id") != user_row["id"] or not hk or data.get("hero_key") != hk):
+            await cb.answer("Данные сессии устарели. Начни заново.", show_alert=True)
+            return
+
         is_admin = user_row["is_admin"] == 1
 
         svc_code = data["service_code"]
         svc_emoji = data.get("service_emoji", "")
         svc_label = data.get("service_label", "")
         country = int(data.get("country") or service_country(data.get("service_key", ""), COUNTRY_UK))
-        hk = data.get("hero_key")
         db_user_id = data["db_user_id"]
 
         await cb.message.edit_text("⏳ Покупаю номер...")
         await cb.answer()
 
+        # Telegram awaits can allow a menu transition or key reassignment.
+        user_row = db_get_user(cb.from_user.id)
+        current_key = (get_user_hero_key(user_row) or (HERO_KEY if _uses_admin_hero(user_row) else None)) if user_row else None
+        if not await _hero_ui_unchanged(cb, state, data) or current_key != hk:
+            await _safe_send_raw(cb.from_user.id, "Сессия или ключ изменились. Покупки не было; проверь цену заново.")
+            return
+        # Consume consent before provider I/O; failed/duplicate clicks cannot rebuy.
+        await state.update_data(sms_confirm_token=None)
+        purchase_data = dict(data, sms_confirm_token=None)
+
+        async def can_buy():
+            owner = db_get_user(cb.from_user.id)
+            key = (get_user_hero_key(owner) or (HERO_KEY if _uses_admin_hero(owner) else None)) if owner else None
+            return key == hk and await _hero_ui_unchanged(cb, state, purchase_data)
+
         existing_cancels = {a["activation_id"] for a in db_user_number_actions(user_row["id"])}
         try:
-            activation = await _purchase_number(svc_code, country, hk, owner_chat=cb.from_user.id)
+            activation = await _purchase_number(svc_code, country, hk, owner_chat=cb.from_user.id, can_buy=can_buy)
         except Exception as e:
             db_error_log(cb.from_user.id, "buy_fail", type(e).__name__)
+            if not await can_buy():
+                await _safe_send_raw(cb.from_user.id, "Сессия или ключ изменились. Покупки не было; проверь цену заново.")
+                return
             new_cancel = any(a["activation_id"] not in existing_cancels
                              for a in db_user_number_actions(user_row["id"]))
             detail = str(e)
@@ -3697,6 +3948,8 @@ async def cb_confirm_buy(cb: CallbackQuery, state: FSMContext):
     except Exception as e:
         db_error_log(cb.from_user.id, "buy_crash", str(e), traceback.format_exc())
         await cb.answer(f"Ошибка: {e}", show_alert=True)
+    finally:
+        lock.release()
 
 
 async def _wait_sms(chat_id, state):
@@ -4290,7 +4543,9 @@ async def _delete_all_user_mailboxes(user_id, max_id, api_key=None):
 
 
 def _mail_provider_label(account):
-    return "HeroSMS Outlook" if _row_get(account, "mail_provider") == "herosms" else "Mail.tm"
+    if _row_get(account, "mail_provider") == "herosms":
+        return "Почта HeroSMS · " + account["email"].rsplit("@", 1)[-1]
+    return "Mail.tm"
 
 
 def _account_status_label(account) -> str:
@@ -4380,7 +4635,7 @@ async def cb_mail_view(cb: CallbackQuery):
             lines.append("Ссылка: уже получена ✅")
         lines.append("")
         if _row_get(account, "mail_provider") == "herosms":
-            lines.append("HeroSMS Outlook: активация только для wolt.com, не постоянный ящик. Проверка существующего ID бесплатна; новое письмо/повторный вход не гарантированы. Платный reorder не запускается.")
+            lines.append("почта HeroSMS: активация только для wolt.com, не постоянный ящик. Проверка существующего ID бесплатна; новое письмо/повторный вход не гарантированы. Платный reorder не запускается.")
             lines.append(f"Почта: ${float(account['mail_cost'] or 0):.4f} (отдельно от SMS)")
         else:
             lines.append("«Последнее письмо» — заново проверю Mail.tm и пришлю свежую ссылку Wolt.")
@@ -4405,7 +4660,7 @@ async def _check_saved_hero_mail(cb, account, user):
         _validate_hero_email(mail, account["mail_activation_id"], account["email"])
         link = _hero_wolt_link(mail) if mail["status"] == "SUCCESS" else None
         db_update_account(account["id"], mail_status=mail["status"], **({"email_link": link} if link else {}))
-        text = f"📧 <code>{html_lib.escape(account['email'])}</code> · HeroSMS Outlook\n\n"
+        text = f"📧 <code>{html_lib.escape(account['email'])}</code> · почта HeroSMS\n\n"
         text += "Только wolt.com, не постоянный ящик. Проверен существующий ID, без платного reorder.\n"
         if link:
             text += f'<a href="{html_lib.escape(link, quote=True)}">🔗 Открыть ссылку Wolt</a>'
@@ -4531,7 +4786,7 @@ async def cb_mail_del_all(cb: CallbackQuery):
         )
         await cb.message.edit_text(
             f"🗑 Удалить ВСЕ свои почты ({len(accounts)})?\n\n"
-            "Mail.tm: ящики и письма удалятся безвозвратно. HeroSMS Outlook: отмена pending активаций требует подтверждения, использованные удаляются только локально; возврат не обещан. "
+            "Mail.tm: ящики и письма удалятся безвозвратно. почта HeroSMS: отмена pending активаций требует подтверждения, использованные удаляются только локально; возврат не обещан. "
             "Статистика успешных SMS-активаций сохранится."
             f"{warning}\n\nЭто действие нельзя отменить.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -4616,7 +4871,7 @@ async def cb_mail_del(cb: CallbackQuery):
         await cb.message.edit_text(
             f"🗑 <b>Удалить почту?</b>\n\n"
             f"<code>{html_lib.escape(account['email'])}</code>\n\n"
-            + ("HeroSMS Outlook: pending активацию отменю только с подтверждением; использованную удалю лишь локально. Постоянный Outlook ящик не удаляется. Возврат не обещан."
+            + ("Почта HeroSMS: pending активацию отменю только с подтверждением; использованную удалю лишь локально. Постоянный ящик не удаляется. Возврат не обещан."
                if _row_get(account, "mail_provider") == "herosms" else
                "Ящик будет удалён с Mail.tm <b>безвозвратно</b>, вместе с письмами."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -6090,7 +6345,7 @@ async def main():
     dp.include_router(router)
     webhook_runner = await _start_hero_webhook_server()
     worker = asyncio.create_task(_number_action_worker())
-    log.info("SMS bot v2.15 started")
+    log.info("SMS bot v2.16 started")
     try:
         await dp.start_polling(_bot)
     finally:
